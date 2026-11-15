@@ -1,0 +1,44 @@
+{
+  "name": "gamedexy",
+  "version": "0.4.1",
+  "description": "Let your AI coding agent read your mobile game's code, open every screen on a simulator or emulator and map it with Gamedexy Game Map: every screen and how they connect, money and ads, bugs, and a comparison with real top games.",
+  "type": "module",
+  "bin": {
+    "gamedexy": "bin/gamedexy.mjs"
+  },
+  "files": [
+    "bin",
+    "src",
+    "skill",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "keywords": [
+    "mobile-games",
+    "game-dev",
+    "ios-simulator",
+    "android-emulator",
+    "mcp",
+    "claude-code",
+    "codex",
+    "playtest",
+    "game-design"
+  ],
+  "homepage": "https://www.gamedexy.com/game-map",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tideandroot/gamedexy-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tideandroot/gamedexy-cli/issues",
+    "email": "support@gamedexy.com"
+  },
+  "license": "FSL-1.1-MIT",
+  "author": "Tide and Root"
+}

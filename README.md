@@ -62,7 +62,5 @@ npm release. Issues are welcome here; for anything about your account, write to 
 
 ## License
 
-From 0.4.0 the CLI is under the [Functional Source License 1.1, MIT future license](LICENSE)
-(FSL-1.1-MIT): you can read, run, change and share it for anything except a product that competes
-with Gamedexy, and each version becomes MIT two years after it is released. Versions 0.1.0 to 0.3.0
-stay MIT. The Gamedexy name and logo are not covered by the license.
+[MIT](LICENSE). Open source: read it, run it, fork it, ship it. The Gamedexy library, Game Map and the MCP server are a hosted service and
+are not part of this repository. The Gamedexy name and logo are not covered by the license.

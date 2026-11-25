@@ -67,10 +67,17 @@ call) and optionally the Gamedexy MCP (`map_*`). Also here: `DEEP.md` (deep runs
    debug-only `GamedexyCapture` file that reads `-gdxState`. Wire each key where the scan says that
    screen opens, the level parameter where a run starts, and `clock=Nd` (the game's day N days on)
    for a deep run. Show the diff, build Debug, and run `gamedexy doctor --release-app <Release build>`.
+   Godot: everything goes in one `gamedexy/` folder that never ships (see `ENGINES.md`): export capture
+   builds from the `<preset> (Gamedexy capture)` preset, release builds from the original, and before
+   shipping run `gamedexy check-export <build>` (exit 1 if any `gamedexy/` path or capture script is inside).
 
 4. **Start.** `gamedexy map start --dir <run folder> --platform ios|android --device <id> --app-id
    <bundle> --app <path> --game "<name>" --engine <engine> --genre <genre> --depth quick|deep
-   --inventory inventory.json --src <repo>`. It opens the run and writes `run-rules.json`.
+   --inventory inventory.json --src <repo>`. It opens the run and writes `run-rules.json`. Leave out
+   `--dir` and the run folder is `~/.gamedexy/runs/<game>/<time>` (`--out DIR` picks another); use the
+   `run_dir` it prints for every later command. Never keep a run in a temp or session scratch folder: runs
+   left there were lost twice. `--game` reuses a game the account already has (slug, id or name); with
+   several matches it stops and lists them, and `--create-new` makes a new one.
 
 5. **Capture every screen.** `gamedexy map capture --dir <dir> --scan <run folder>/scan.json --all`.
    It launches each key, waits for the screen to settle, screenshots it and writes `labels.json`

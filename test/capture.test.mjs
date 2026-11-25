@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -96,4 +96,40 @@ test("flows from code: the scan's navigation in capture keys, with tabs and leve
   assert.ok(has("shop_gems", "shop_coins", "tab"));
   assert.ok(has("home", "world_moss_cave", "level"));
   assert.ok(!nav.some((e) => e.from === e.to));
+});
+
+test("Godot capture list opens code-built screens from OPENERS, with an optional fixed seed, debug builds only", () => {
+  const d = captureInit({ src: fx("godot_code"), dryRun: true, seed: 42 });
+  const c = d.content;
+  assert.ok(c.includes('"shop_sheets_upgrades": {"path": "res://src/ui/shop_sheets.gd", "call": "open_sheet", "args": ["upgrades"]}'), c);
+  assert.ok(c.includes('"pause_result": {"path": "res://src/ui/pause_modal.gd", "call": "show_result", "args": [false, 0]}'));
+  assert.ok(c.includes('"flow_root_shop": {"path": "res://src/ui/flow_root.gd", "call": "go_to", "args": [1]}'));
+  assert.ok(c.includes('"pause_dlg": {"path": "res://src/ui/pause_modal.gd", "call": "_ask_quit", "args": []}'));
+  assert.ok(c.includes("const DEFAULT_SEED := 42") && c.includes("seed(seed_val)"));
+  // The seed is readable by the game (its own RandomNumberGenerator), a bad one is ignored, and a call that does not fit is refused.
+  assert.ok(c.includes("func seed_value() -> int:") && c.includes('values["seed"] = str(DEFAULT_SEED)') && c.includes("is_valid_int()"));
+  assert.ok(c.includes("func _args_fit(") && c.includes("not (node.has_method(method) and _args_fit(node, method, args))"));
+  assert.ok(c.includes("if not (made is Node):"), "a script that is not a Node is never made into a screen");
+  assert.ok(!c.includes("fixes the RNG") && c.includes("makes its own RandomNumberGenerator"));
+  assert.ok(!c.includes('"shop_sheets":'), "containers are not opened");
+  // Everything runs only in debug builds, and a launch can override the seed.
+  assert.ok(c.indexOf("OS.is_debug_build()") < c.indexOf("OPENERS.has(key)"));
+  assert.ok(c.includes('values.get("seed", "")'));
+  assert.equal(captureInit({ src: fx("godot_code"), dryRun: true }).content.includes("const DEFAULT_SEED := -1"), true);
+  const plan = d.screens.find((s) => s.key === "shop_sheets_map");
+  assert.equal(plan.code_built, true);
+  assert.match(plan.wire, /opened by the capture file/);
+  // Scene-only Godot games keep the old file (no OPENERS entries).
+  assert.ok(!captureInit({ src: fx("godot"), dryRun: true }).content.includes('"path":'));
+});
+
+test("capture init --seed needs a whole number (a bare --seed is rejected, not read as 1)", () => {
+  const bin = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "gamedexy.mjs");
+  const run = (...a) => spawnSync(process.execPath, [bin, "capture", "init", "--src", fx("godot_code"), "--dry-run", ...a], { encoding: "utf8" });
+  for (const a of [["--seed"], ["--seed", "--force"], ["--seed", "-1"], ["--seed", "abc"]]) {
+    const r = run(...a);
+    assert.notEqual(r.status, 0, a.join(" "));
+    assert.match(r.stderr + r.stdout, /--seed/, a.join(" "));
+  }
+  assert.equal(run("--seed", "7").status, 0);
 });

@@ -8,15 +8,17 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { accessToken, callTool } from "./auth.mjs";
 import { bridge, has, isMac } from "./devices.mjs";
+import { lookupGame, resolveGame } from "./games.mjs";
 import { freshAndroid, freshIos, parseState, restoreData as restore, stateArgs } from "./fresh.mjs";
 import { GUARD_VERSION, blockedText, checkTap, foregroundAlarm, screenAlarm } from "./guard.mjs";
 import { appSizeMb, coldStart, layoutOf } from "./measure.mjs";
 import { cleanCritique, cleanNotification, clockState, earnRow, fastlaneListing, overlap, parseDays, readDump } from "./extras.mjs";
 import { feedbackRow, findHints, parseHints, scrub } from "./hints.mjs";
 import { readText, readerName } from "./ocr.mjs";
-import { hamming, matchScreen, phash } from "./phash.mjs";
+import { hamming, matchScreen, normText, phash, sameText } from "./phash.mjs";
 import { decodePng, encodePng, resize } from "./png.mjs";
 import { systemPrompt } from "./prompts.mjs";
+import { temporaryWarning } from "./rundir.mjs";
 import { LANGS, getTextSize, isDefaultSize, langArgs, langOf, prepareIosDevice, setAndroidAppLang, setTextSize, textSizeOf } from "./variant.mjs";
 
 const THUMB_W = 402;
@@ -69,10 +71,13 @@ export async function startSignedIn(o) {
   if (o.game && !o.callTool) await accessToken();
   // A rejected inventory must not leave an opened run behind (launch gate 2026-11, bug 4).
   const inv = o.inventory ? readInventory(o.inventory) : null;
-  const local = start(o);
-  if (local.refused || !o.game) return local;
   const call = o.callTool ?? callTool;
-  const g = await call("map_create_game", { name: String(o.game), platform: o.platform, ...(o.engine ? { engine: String(o.engine) } : {}), ...(o.genre ? { genre: String(o.genre) } : {}) });
+  // Several games could be meant: stop before anything is made, locally or on the server.
+  const found = o.game ? await lookupGame(call, { ...o, game: String(o.game) }) : null;
+  const local = (o.startFn ?? start)(o); // startFn: a test seam (start() needs a real simulator or emulator)
+  if (local.refused || !o.game) return local;
+  // Look the account's games up first (slug, then name): reuse a match, list the candidates when several fit.
+  const g = await resolveGame(call, { game: String(o.game), platform: o.platform, createNew: o.createNew, ...(o.engine ? { engine: String(o.engine) } : {}), ...(o.genre ? { genre: String(o.genre) } : {}) }, found);
   const r = await call("map_start_run", {
     game: g.game_id,
     ...local.for_map_start_run,
@@ -92,11 +97,12 @@ export async function startSignedIn(o) {
   const { for_map_start_run: _sent, next: _next, ...rest } = local;
   return {
     ...rest,
-    game: { id: g.game_id, slug: g.slug, created: g.created, map_url: g.map_url },
+    game: { id: g.game_id, slug: g.slug, created: g.created, ...(g.reused ? { reused: true } : {}), map_url: g.map_url },
+    ...(g.created === true ? { note: `No game named "${o.game}" existed, so this created a new Game Map game. If it should go to an existing game, start again with --game <slug|id>.` } : {}),
     run_id: r.run_id,
     rules: join(o.dir, "run-rules.json"),
     ...(inventory ? { inventory: "sent" } : { inventory: "not sent: pass --inventory inventory.json (screens, products, ads, currencies, events from the code)" }),
-    next: "Launch first: gamedexy map launch (map start does not open the game). Then play: gamedexy map shot / find / tap. Label with the categories and tags in the rules file. Then gamedexy map send and gamedexy map finish.",
+    next: "Launch first: gamedexy map launch --dir <run_dir above> (map start does not open the game). Then play: gamedexy map shot / find / tap. Label with the categories and tags in the rules file. Then gamedexy map send and gamedexy map finish.",
   };
 }
 
@@ -197,8 +203,11 @@ export function start(o) {
   }
   saveRun(dir, run);
   // Shaped for the map_start_run tool.
+  const tmpWarn = temporaryWarning(dir);
   return {
     folder: dir,
+    run_dir: resolve(dir),
+    ...(tmpWarn ? { warning: tmpWarn } : {}),
     ...(fresh ? { fresh } : {}),
     for_map_start_run: { rights_basis: "own_build", build: run.build, device: { name: run.device_name, os: run.os } },
     ...(run.hints ? { hints: { file: run.hints.file, goals: run.hints.goals.map((g) => g.key), next: "Read the full hints with: gamedexy map hints --dir <folder>" } } : o.src ? { hints: null, tip: "No gamedexy.map.md in the repo. Draft one from the code with: gamedexy hints init --src <repo> (ask the developer first)" } : {}),
@@ -301,6 +310,7 @@ export async function shot(o) {
   const stepsPath = join(o.dir, "steps.jsonl");
   const steps = readJsonl(stepsPath);
   const n = steps.length + 1;
+  mkdirSync(join(o.dir, "shots"), { recursive: true }); // a run folder made by hand, or cleaned, still works
   const base = join(o.dir, "shots", String(n).padStart(4, "0"));
   const png = `${base}.png`;
   const img = capture(run, png);
@@ -553,9 +563,26 @@ export function stepsToSend(dir, steps) {
   return steps.filter((s) => (capSteps.has(s.step) ? keep.has(s.step) : /^capture: start screen/.test(s.action ?? "") ? s.step === firstStart : true));
 }
 
+/**
+ * Steps to leave out of a send: `--skip a,b` plus the labels file's `exclude` list. Each entry is a
+ * screen key (every step labelled with it) or a step number. A skipped step needs no label.
+ */
+export function skipSet(o, labels) {
+  const raw = [...(Array.isArray(labels?.exclude) ? labels.exclude : []), ...(typeof o.skip === "string" ? o.skip.split(",") : Array.isArray(o.skip) ? o.skip : [])];
+  return new Set(raw.map((x) => String(x).trim()).filter(Boolean));
+}
+
 function screensFor(o) {
   const labels = JSON.parse(readFileSync(o.labels, "utf8"));
-  const steps = stepsToSend(o.dir, readJsonl(join(o.dir, "steps.jsonl")));
+  const skip = skipSet(o, labels);
+  const all = stepsToSend(o.dir, readJsonl(join(o.dir, "steps.jsonl")));
+  const isSkipped = (st) => skip.has(String(st.step)) || skip.has(String(labels.steps?.[String(st.step)]?.[0] ?? "\0"));
+  const steps = all.filter((st) => !isSkipped(st));
+  const dropped = all.filter(isSkipped).map((st) => st.step);
+  const known = new Set([...all.map((st) => String(st.step)), ...Object.values(labels.steps ?? {}).map((v) => String(v?.[0]))]);
+  const asked = typeof o.skip === "string" ? o.skip.split(",").map((x) => x.trim()).filter(Boolean) : [];
+  const unknown = asked.filter((k) => !known.has(k));
+  if (unknown.length) throw new Error(`--skip names no step or screen key in this run: ${unknown.join(", ")}`);
   const missing = steps.filter((s) => !labels.steps?.[String(s.step)]).map((s) => s.step);
   if (missing.length) throw new Error(`Label every step first. Missing: ${missing.join(", ")}`);
   const screens = steps.map((s) => {
@@ -570,6 +597,7 @@ function screensFor(o) {
   });
   // The MCP schema wants strings, never null: drop empty fields instead of sending null.
   for (const sc of screens) for (const k of Object.keys(sc)) if (sc[k] === null || sc[k] === undefined) delete sc[k];
+  Object.defineProperty(screens, "dropped", { value: dropped, enumerable: false });
   return screens;
 }
 
@@ -582,7 +610,7 @@ export function payload(o) {
     writeFileSync(file, JSON.stringify({ run_id: run.run_id, screens: screens.slice(i, i + 25) }));
     out.push(file);
   }
-  return { batches: out, screens: screens.length, next: "Send each batch to map_add_screens; save each reply to a file and run: gamedexy map upload --dir <folder> --reply <file>" };
+  return { batches: out, screens: screens.length, ...(screens.dropped.length ? { skipped_steps: screens.dropped } : {}), next: "Send each batch to map_add_screens; save each reply to a file and run: gamedexy map upload --dir <folder> --reply <file>" };
 }
 
 /** PUT the images to the upload links in a saved map_add_screens reply. */
@@ -640,7 +668,8 @@ export async function send(o) {
     uploaded += put.uploaded;
   }
   return {
-    screens: screens.length, accepted, uploaded, ...(skipped.length ? { skipped } : {}),
+    run_dir: resolve(o.dir),
+    screens: screens.length, accepted, uploaded, ...(screens.dropped.length ? { skipped_steps: screens.dropped } : {}), ...(skipped.length ? { skipped } : {}),
     ...(personal.length ? { personal_data: personal, tell_the_developer: "These screens may show personal data (emails, phone numbers, card numbers). Ask the developer to check them on the map and delete any that are real." } : {}),
     next: "gamedexy map finish --dir <folder> [--issues issues.json]" };
 }
@@ -667,7 +696,7 @@ export async function finish(o) {
     stats: s,
   };
   const reply = await (o.callTool ?? callTool)("map_finish_run", args);
-  return { ...reply, ...(re.summary ? { rechecked_from_last_build: re.summary } : {}), next: reply.map_url ? `Open ${reply.map_url} and walk the developer through the Overview tab.` : undefined };
+  return { ...reply, run_dir: resolve(o.dir), ...(re.summary ? { rechecked_from_last_build: re.summary } : {}), next: reply.map_url ? `Open ${reply.map_url} and walk the developer through the Overview tab.` : undefined };
 }
 
 /**
@@ -1222,13 +1251,36 @@ async function settle(run, ms) {
 }
 
 /**
+ * Two shots of the same screen? Animation (dice, particles, a pulsing button) moves the hash a little and
+ * the OCR text a little, so: very close hashes match outright, a close hash with loosely equal text also matches.
+ */
+export function looksSame(a, b) {
+  const d = hamming(a.phash, b.phash);
+  // No text on either side (no OCR reader, or a text-free screen): nothing to compare, so only the strict hash rule.
+  if (!normText(a.text) || !normText(b.text)) return d <= NEAR_SAME_STRICT;
+  // Text must agree at every distance: two screens with one layout (result vs result_snuffed) sit a few bits apart.
+  // Text that differs only in its digits (Day 1 +25 vs Day 3 +40) is a different state, not the same screen,
+  // unless the picture is all but identical (2 bits or fewer): then a digit is OCR noise on a moving sprite.
+  return d <= 12 && sameText(a.text, b.text) && (d <= NEAR_SAME_STRICT || sameNumbers(a.text, b.text));
+}
+
+const NEAR_SAME_STRICT = 2;
+const digitsOf = (t) => String(t ?? "").replace(/[^0-9]/g, "");
+/** Numbers must agree too: OCR typos in letters are tolerated, a changed score or day count is a different state. */
+function sameNumbers(a, b) {
+  return digitsOf(a) === digitsOf(b);
+}
+
+/**
  * Open every screen on the scan's checklist through the game's debug-only capture list
  * (`-gdxState screen=<key>`), wait for it to settle, screenshot it and label it from its key.
- * Never taps. A screen that comes up looking like the start screen did not open: it is reported,
- * not labelled as that screen. Labels go to labels.json in the run folder (merged with any there).
+ * Never taps. A screen that comes up looking like the start screen (animation tolerated) was not reached:
+ * it is reported, not labelled as that screen. A key whose opener was written with guessed arguments is
+ * skipped unless `includeGuessed`, and then never counted as a real capture. Labels go to labels.json in the run folder (merged with any there).
  */
 export async function captureAll(o) {
   const run = loadRun(o.dir);
+  mkdirSync(join(o.dir, "shots"), { recursive: true }); // shots/ is made here when it is missing
   // Tests pass fakes for the device side; everything else is the real code.
   const io = { launch, shot, settle, ...(o.io ?? {}) };
   if (!o.scan || !existsSync(o.scan)) throw new Error("--scan is the scan.json from gamedexy scan (its checklist says what to open)");
@@ -1265,41 +1317,57 @@ export async function captureAll(o) {
 
   const results = [];
   const seenByHash = [];
+  // Every frame known to be the start screen: the plain launch, then each key that came up as it. An animated
+  // start screen drifts from frame to frame, so each one seen widens what counts as "the same".
+  const startFrames = [{ phash: baseStep.phash, text: baseStep.text }];
+  const skippedGuessed = [];
   let homeMatched = false;
   for (const c of list) {
+    if (c.code?.guessed_args && !o.includeGuessed) {
+      skippedGuessed.push({ key: c.key, call: `${c.code.call ?? c.code.set}(${(c.code.args ?? []).join(", ")})`, why: "the capture list opens this with guessed arguments; fix its OPENERS line, then run with --include-guessed" });
+      continue;
+    }
     const state = [c.open, o.with].filter(Boolean).join(",");
     await io.launch({ dir: o.dir, state, capture: true });
     await io.settle(run, settleMs);
     const s = await io.shot({ dir: o.dir, action: `capture: ${c.key}` });
     const step = readJsonl(join(o.dir, "steps.jsonl")).at(-1);
     const row = { utc: utc(), key: c.key, open: state, step: s.step, category: c.category ?? null, ...(c.level ? { level: c.level } : {}) };
-    const sameAsStart = hamming(step.phash, baseStep.phash) <= 4 && step.text === baseStep.text;
-    const dup = seenByHash.find((x) => hamming(x.phash, step.phash) <= 2 && x.text === step.text);
+    const sameAsStart = startFrames.some((f) => looksSame(f, step));
+    const dup = seenByHash.find((x) => looksSame(x, step));
     if (s.alarm === "purchase-sheet") {
       Object.assign(row, { ok: false, reason: "a purchase sheet opened: never captured (rule 1); relaunched" });
       await io.launch({ dir: o.dir });
     } else if (!s.app_running) Object.assign(row, { ok: false, reason: "the game was not running after the launch (crash?)" });
-    else if (sameAsStart && !(c.category === "home" && !homeMatched)) Object.assign(row, { ok: false, reason: "looks the same as the start screen: the capture list does not open this key yet" });
-    else if (dup && !c.level) Object.assign(row, { ok: false, reason: `looks the same as ${dup.key}: check the capture list opens the right screen` });
+    else if (sameAsStart && !(c.category === "home" && !homeMatched)) Object.assign(row, { ok: false, not_reached: true, reason: "not reached: the launch returned but the screen still looks the same as the start screen (animation ignored); the capture list does not open this key yet" });
+    else if (dup && !c.level) Object.assign(row, { ok: false, not_reached: true, reason: `not reached: looks the same as ${dup.key}; check the capture list opens the right screen` });
     else row.ok = true;
+    if (c.code?.guessed_args && row.ok) row.guessed = true;
     if (sameAsStart && c.category === "home") homeMatched = true;
+    if (sameAsStart && !row.ok) startFrames.push({ phash: step.phash, text: step.text });
     if (row.ok) {
       seenByHash.push({ key: c.key, phash: step.phash, text: step.text });
       const name = c.level ? levelNames[c.level] : null;
-      labels.screens[c.key] ??= { title: name ? `${titleOf(run.levels?.param ?? "level")}: ${name}` : titleOf(c.key), category: c.category ?? null, tags: [], proposed_tags: [], confidence: c.sure ? 0.9 : 0.6 };
-      labels.steps[String(s.step)] = [c.key, `captured: ${state}`];
+      labels.screens[c.key] ??= { title: name ? `${titleOf(run.levels?.param ?? "level")}: ${name}` : titleOf(c.key), category: c.category ?? null, tags: [], proposed_tags: [], confidence: row.guessed ? 0.3 : c.sure ? 0.9 : 0.6 };
+      labels.steps[String(s.step)] = [c.key, row.guessed ? `captured with guessed arguments (unsure): ${state}` : `captured: ${state}`];
     } else labels.steps[String(s.step)] = [dup && !sameAsStart ? dup.key : startKey, `capture of ${c.key} did not open it`];
     appendJsonl(capsPath, row);
     results.push(row);
   }
   writeFileSync(labelsPath, JSON.stringify(labels, null, 1));
-  const ok = results.filter((r) => r.ok);
+  const ok = results.filter((r) => r.ok && !r.guessed);
+  const guessed = results.filter((r) => r.ok && r.guessed).map((r) => r.key);
   const failed = results.filter((r) => !r.ok).map(({ key, reason, step }) => ({ key, step, reason }));
+  const notReached = results.filter((r) => r.not_reached).map((r) => r.key);
   const noCategory = Object.entries(labels.screens).filter(([, l]) => !l.category).map(([k]) => k);
   return {
+    run_dir: resolve(o.dir),
     captured: ok.length,
     of: results.length,
     failed,
+    ...(notReached.length ? { not_reached: notReached } : {}),
+    ...(guessed.length ? { unsure_guessed_args: guessed, unsure_why: "These opened with guessed arguments, so they are not counted as captured; check each screenshot." } : {}),
+    ...(skippedGuessed.length ? { skipped_guessed: skippedGuessed } : {}),
     ...(run.levels ? { levels: (({ count, reached_count }) => ({ count, reached: reached_count }))(levelsReached(o.dir, run)) } : {}),
     labels: labelsPath,
     ...(noCategory.length ? { needs_category: noCategory, tip: "Pick a category for these from run-rules.json in labels.json before map send." } : {}),

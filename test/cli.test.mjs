@@ -295,3 +295,108 @@ test("init installs the skill without overwriting a file it did not write", asyn
   assert.equal(r.skill[0].done, false);
   assert.equal(read(j(home, ".claude", "skills", "gamedexy-game-map", "SKILL.md"), "utf8"), "mine");
 });
+
+// ---- gamedexy init: Antigravity (Gemini) ----------------------------------------------------------------
+
+async function agyHome(config) {
+  const { mkdtempSync, mkdirSync, writeFileSync: write } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join: j } = await import("node:path");
+  const home = mkdtempSync(j(tmpdir(), "gdx-agy-"));
+  if (config !== undefined) {
+    mkdirSync(j(home, ".gemini", "config"), { recursive: true });
+    write(j(home, ".gemini", "config", "mcp_config.json"), config);
+  }
+  return { home, file: j(home, ".gemini", "config", "mcp_config.json") };
+}
+const MCP_ENTRY = { command: "npx", args: ["-y", "mcp-remote@0.16.7", "https://www.gamedexy.com/api/mcp"] };
+
+test("init (Antigravity): adds the gamedexy entry, keeps every other server and key, and never writes a token", async () => {
+  const { init } = await import("../src/init.mjs");
+  const { readFileSync: read, existsSync: ex } = await import("node:fs");
+  const existing = { mcpServers: { other: { command: "node", args: ["a.js"], env: { KEY: "secret-stays" }, disabled: false }, remote: { serverUrl: "https://x.example/mcp", headers: { Authorization: "Bearer keep-me" } } }, someSetting: { a: 1 } };
+  const { home, file } = await agyHome(JSON.stringify(existing, null, 2));
+  const r = init({ agent: "antigravity", home, has: () => false });
+  const step = r.mcp.find((m) => m.agent === "Antigravity");
+  assert.equal(step.done, true);
+  const out = JSON.parse(read(file, "utf8"));
+  assert.deepEqual(out.mcpServers.gamedexy, MCP_ENTRY);
+  assert.deepEqual(out.mcpServers.other, existing.mcpServers.other);
+  assert.deepEqual(out.mcpServers.remote, existing.mcpServers.remote);
+  assert.deepEqual(out.someSetting, { a: 1 });
+  assert.deepEqual(Object.keys(out.mcpServers), ["other", "remote", "gamedexy"]);
+  // Nothing sensitive is written for gamedexy, and the old file is backed up once.
+  assert.equal(JSON.stringify(out.mcpServers.gamedexy).match(/token|bearer|key|secret|authorization/i), null);
+  assert.deepEqual(JSON.parse(read(`${file}.bak-gamedexy-init`, "utf8")), existing);
+  assert.ok(step.diff.some((l) => l.startsWith("+") && l.includes('"command": "npx"')));
+  assert.ok(ex(file));
+});
+
+test("init (Antigravity): idempotent, never changes an existing gamedexy entry, --dry-run shows the diff and writes nothing", async () => {
+  const { init } = await import("../src/init.mjs");
+  const { readFileSync: read } = await import("node:fs");
+  const { home, file } = await agyHome(JSON.stringify({ mcpServers: { a: { command: "x" } } }));
+  const before = read(file, "utf8");
+  const dry = init({ agent: "antigravity", home, dryRun: true, has: () => false }).mcp[0];
+  assert.equal(dry.done, false);
+  assert.match(dry.why, /dry run/);
+  assert.ok(dry.diff.some((l) => l.includes('"mcp-remote@0.16.7"')));
+  assert.equal(read(file, "utf8"), before);
+  assert.equal(init({ agent: "antigravity", home, has: () => false }).mcp[0].done, true);
+  const after = read(file, "utf8");
+  const again = init({ agent: "antigravity", home, has: () => false }).mcp[0];
+  assert.equal(again.done, false);
+  assert.match(again.why, /already connected/);
+  assert.equal(read(file, "utf8"), after);
+  // A different gamedexy entry (hand-edited) is left alone too.
+  const mine = { mcpServers: { gamedexy: { command: "my-bridge" } } };
+  const h2 = await agyHome(JSON.stringify(mine));
+  init({ agent: "antigravity", home: h2.home, has: () => false });
+  assert.deepEqual(JSON.parse(read(h2.file, "utf8")), mine);
+});
+
+test("init (Antigravity): creates the config when the folder exists but the file does not; --transport url writes the native remote entry", async () => {
+  const { init } = await import("../src/init.mjs");
+  const { mkdirSync: mk, readFileSync: read } = await import("node:fs");
+  const { join: j } = await import("node:path");
+  const { home, file } = await agyHome();
+  mk(j(home, ".gemini", "config"), { recursive: true });
+  assert.equal(init({ agent: "antigravity", home, has: () => false, transport: "url" }).mcp[0].done, true);
+  assert.deepEqual(JSON.parse(read(file, "utf8")), { mcpServers: { gamedexy: { serverUrl: "https://www.gamedexy.com/api/mcp" } } });
+});
+
+test("init (Antigravity): only when Antigravity is installed (agy or its config folder); a file it cannot parse is left alone", async () => {
+  const { init } = await import("../src/init.mjs");
+  const { existsSync: ex, readFileSync: read } = await import("node:fs");
+  const { join: j } = await import("node:path");
+  // Not installed: nothing is created under ~/.gemini, and `all` says nothing about it.
+  const none = await agyHome();
+  const all = init({ agent: "all", home: none.home, has: () => false, dryRun: true });
+  assert.ok(!all.mcp.some((m) => m.agent === "Antigravity"));
+  const asked = init({ agent: "antigravity", home: none.home, has: () => false });
+  assert.match(asked.mcp[0].why, /not found/);
+  assert.ok(!ex(j(none.home, ".gemini")));
+  // The agy command alone is enough (the folder is made).
+  const viaAgy = await agyHome();
+  assert.equal(init({ agent: "antigravity", home: viaAgy.home, has: (c) => c === "agy" }).mcp[0].done, true);
+  assert.ok(ex(viaAgy.file));
+  // Broken JSON is not touched.
+  const bad = await agyHome("{ not json");
+  const r = init({ agent: "antigravity", home: bad.home, has: () => false }).mcp[0];
+  assert.equal(r.done, false);
+  assert.match(r.why, /not valid JSON/);
+  assert.equal(read(bad.file, "utf8"), "{ not json");
+  // An unexpected shape is not touched either.
+  const odd = await agyHome(JSON.stringify({ mcpServers: [] }));
+  assert.match(init({ agent: "antigravity", home: odd.home, has: () => false }).mcp[0].why, /unexpected shape/);
+});
+
+test("init: an unknown --transport is an error, not a silent stdio fallback", async () => {
+  const { init } = await import("../src/init.mjs");
+  const { existsSync: ex } = await import("node:fs");
+  const { join: j } = await import("node:path");
+  const { home } = await agyHome();
+  assert.throws(() => init({ agent: "antigravity", home, has: () => false, transport: "sse" }), /--transport must be stdio or url \(got "sse"\)/);
+  assert.ok(!ex(j(home, ".gemini")), "nothing was written");
+  assert.equal(init({ agent: "antigravity", home, has: () => true, transport: "stdio", dryRun: true }).mcp[0].agent, "Antigravity");
+});

@@ -8,6 +8,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSy
 import { homedir } from "node:os";
 import { basename, extname, join, relative, sep } from "node:path";
 
+import { scanGodotCode } from "./godot-code.mjs";
 import { findLevels } from "./levels.mjs";
 
 export const SCAN_SCHEMA = "gamedexy.scan/1";
@@ -16,6 +17,7 @@ const SKIP_DIRS = new Set([
   ".git", ".svn", "node_modules", "build", "Build", "Builds", "DerivedData", "Pods", ".build", "Carthage",
   "Library", "Temp", "Logs", "obj", "UserSettings", ".gradle", ".idea", ".godot", ".import", ".venv",
   "vendor", "dist", "out", "xcuserdata", "fastlane", "Packages", "TextMesh Pro", "Plugins",
+  "gamedexy", // Gamedexy's own dev folder (capture code, hooks): never the game's screens
 ]);
 const READ_EXT = new Set([".swift", ".kt", ".java", ".gd", ".tscn", ".cs", ".storekit", ".json", ".xml", ".godot", ".asset"]);
 const MAX_FILES = 20000;
@@ -42,7 +44,7 @@ export function walk(src) {
       const p = join(d, e.name);
       if (e.isDirectory()) {
         if (!SKIP_DIRS.has(e.name) && !e.name.endsWith(".xcassets") && !e.name.endsWith(".xcodeproj") && !e.name.endsWith(".app")) stack.push(p);
-      } else out.push({ abs: p, rel: relative(src, p).split(sep).join("/"), ext: extname(e.name).toLowerCase(), name: e.name });
+      } else if (!/^gamedexy_(stub|capture|codex)\.gd(\.uid)?$/.test(e.name)) out.push({ abs: p, rel: relative(src, p).split(sep).join("/"), ext: extname(e.name).toLowerCase(), name: e.name });
     }
   }
   return out.sort((a, b) => a.rel.localeCompare(b.rel));
@@ -212,10 +214,12 @@ function addScreen(r, s) {
   if (have) {
     if (s.sure && !have.sure) Object.assign(have, { sure: true, why: s.why });
     if (s.tabs && !have.tabs) have.tabs = s.tabs;
+    if (s.code && !have.code) have.code = s.code;
     return have;
   }
   const row = { key: s.key, name: s.name, kind: s.kind, where: s.where, sure: Boolean(s.sure), why: s.why };
   if (s.tabs) row.tabs = s.tabs;
+  if (s.code) row.code = s.code;
   r.screens.push(row);
   return row;
 }
@@ -655,6 +659,12 @@ function scanGodot(r, files) {
       if (CURRENCY_WORDS.has(n)) addCurrency(r, n, `${f.rel}:${lineAt(text, m.index)}`, "stored count named like a currency");
     }
   }
+  // Screens built in GDScript instead of in scenes.
+  try {
+    scanGodotCode(r, files, { addScreen, addEdge, lineAt, screenKey, isTest: (rel) => TEST_PATH.test(rel), scriptScenes, ownersOf: (rel) => scriptScenes.get(rel) ?? [screenKey(basename(rel, ".gd"))] });
+  } catch (e) {
+    r.unsure.push({ where: "project.godot", name: "code-built screens", reason: `the GDScript screen reader stopped (${String(e?.message ?? e).slice(0, 80)}); screens built in code may be missing` });
+  }
 }
 
 // ---- Unity --------------------------------------------------------------------------------
@@ -722,7 +732,12 @@ function scanUnity(r, files, all) {
 
 const CAPTURE_KINDS = new Set(["screen", "sheet", "modal", "scene", "overlay", "alert"]);
 
-export function checklist(r) {
+/**
+ * What to open, in order. A Godot class nothing creates (`code.live === false`) is left out unless
+ * `includeDead`: opening it needs a guessed call that can crash the game, and it is usually leftover code.
+ * Left-out keys are listed in `leftOut` (an array the caller may pass in).
+ */
+export function checklist(r, { includeDead = false, leftOut = null } = {}) {
   const out = [];
   for (const s of r.screens) {
     if (!CAPTURE_KINDS.has(s.kind)) continue;
@@ -730,10 +745,12 @@ export function checklist(r) {
     if (s.kind === "scene" && ins.length && ins.every((e) => e.kind === "embed")) continue; // drawn behind other screens
     const cat = guessCategory(s.key) ?? (r.currencies.some((c) => s.key === c.key || s.key.startsWith(`${c.key}_`)) ? "shop" : null);
     const how = r.edges.find((e) => e.to === s.key);
-    const base = { key: s.key, category: cat, open: `screen=${s.key}`, needs: how?.trigger ?? null, from: how?.from ?? null, sure: s.sure && Boolean(cat) };
+    const base = { key: s.key, category: cat, open: `screen=${s.key}`, needs: how?.trigger ?? null, from: how?.from ?? null, sure: s.sure && Boolean(cat), ...(s.code ? { code: s.code } : {}) };
+    const dead = s.code?.live === false && !includeDead;
+    const add = (c) => (dead ? leftOut?.push({ key: c.key, reason: "nothing in the project creates or names this class (dead code, code.live is false); open it by hand or pass --include-dead" }) : out.push(c));
     if (s.tabs) {
-      for (const t of s.tabs) for (const v of t.values) out.push({ ...base, key: `${s.key}_${screenKey(v)}`, open: `screen=${s.key},${t.state}=${v}` });
-    } else out.push(base);
+      for (const t of s.tabs) for (const v of t.values) add({ ...base, key: `${s.key}_${screenKey(v)}`, open: `screen=${s.key},${t.state}=${v}` });
+    } else add(base);
   }
   // Each level of the main level list, opened in play (PR 1b): `screen=<play screen>,stage=<id>`.
   const lv = r.levels?.[0];
@@ -754,7 +771,7 @@ export function levelsOf(r) {
 
 /** The draft inventory.json `map start --inventory` accepts (names and file locations only). */
 export function toInventory(r) {
-  const cl = checklist(r);
+  const cl = r.checklist ?? checklist(r);
   return {
     screens: r.screens
       .filter((s) => CAPTURE_KINDS.has(s.kind) && !(s.kind === "scene" && r.edges.some((e) => e.to === s.key) && r.edges.filter((e) => e.to === s.key).every((e) => e.kind === "embed")))
@@ -804,7 +821,9 @@ export function scanRepo(src, o = {}) {
   // Edges that point at a screen the scan never listed (another module, or a name it could not resolve).
   const keys = new Set(r.screens.map((s) => s.key));
   for (const e of r.edges) if (e.to !== "launch" && !keys.has(e.to)) r.unsure.push({ where: e.where, name: e.to, reason: `opened from ${e.from} but its screen was not found` });
-  r.checklist = checklist(r);
+  const leftOut = [];
+  r.checklist = checklist(r, { includeDead: Boolean(o.includeDead), leftOut });
+  if (leftOut.length) r.checklist_left_out = leftOut;
   for (const c of r.checklist) if (!c.category) r.unsure.push({ where: r.screens.find((s) => c.key.startsWith(s.key))?.where ?? null, name: c.key, reason: "no Gamedexy category guessed from the name; pick one from run-rules.json" });
   return r;
 }
@@ -814,7 +833,7 @@ export function defaultOut(src) {
 }
 
 export function scan(o) {
-  const r = scanRepo(o.src, { engine: o.engine });
+  const r = scanRepo(o.src, { engine: o.engine, includeDead: o.includeDead });
   const out = o.out ?? defaultOut(o.src);
   mkdirSync(out, { recursive: true });
   const scanFile = join(out, "scan.json");
@@ -829,6 +848,7 @@ export function scan(o) {
     files_read: r.files_read,
     screens: byKind,
     to_capture: r.checklist.length,
+    ...(r.checklist_left_out ? { left_out: r.checklist_left_out.length, left_out_why: `${r.checklist_left_out.length} screen${r.checklist_left_out.length === 1 ? "" : "s"} left off the capture checklist because nothing in the project creates or names them (dead code). Listed under checklist_left_out in scan.json; add them back with --include-dead.` } : {}),
     edges: r.edges.length,
     products: r.products.length,
     ads: r.ads.length,

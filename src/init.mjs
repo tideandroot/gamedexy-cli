@@ -5,7 +5,7 @@
 // It only writes in places the developer's own agent tools read from, never
 // overwrites a file it did not write, and says exactly what it changed.
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -40,17 +40,60 @@ function withMark(md) {
   return m ? `${m[0]}${MARK}\n${md.slice(m[0].length)}` : `${MARK}\n${md}`;
 }
 
+// ---- Antigravity (Gemini) -------------------------------------------------------------------------------
+// Antigravity reads MCP servers from ~/.gemini/config/mcp_config.json ({ "mcpServers": { name: entry } }); an entry has
+// either `command` (stdio) or `serverUrl` (remote, Streamable HTTP). Its docs say remote servers get OAuth with DCR
+// natively, but the sign-in is documented only for the desktop app (Authenticate, paste the code), not for `agy`. The
+// stdio bridge below is the entry that already works in the CLI (mcp-remote opens the browser itself), so it is the
+// default; `transport: "url"` writes the native remote entry instead.
+export const MCP_REMOTE = "mcp-remote@0.16.7";
+export const antigravityEntry = (transport = "stdio") =>
+  transport === "url" ? { serverUrl: MCP_URL } : { command: "npx", args: ["-y", MCP_REMOTE, MCP_URL] };
+
+/**
+ * Add the gamedexy server to Antigravity's MCP config. Keeps every other entry and key, never overwrites an existing
+ * gamedexy entry (even a different one), never writes a token (the entry has no env or headers), and leaves a file it
+ * cannot parse alone. A changed file is backed up first as mcp_config.json.bak-gamedexy-init (not overwritten).
+ */
+export function connectAntigravity({ home, dryRun = false, transport = "stdio" }) {
+  const file = join(home, ".gemini", "config", "mcp_config.json");
+  const entry = antigravityEntry(transport);
+  let cfg = {};
+  if (existsSync(file)) {
+    const raw = readFileSync(file, "utf8");
+    try {
+      cfg = raw.trim() ? JSON.parse(raw) : {};
+    } catch {
+      return { agent: "Antigravity", file, done: false, why: "mcp_config.json is not valid JSON; left as it is. Add the gamedexy entry by hand (see mcp_by_hand)." };
+    }
+    if (!cfg || typeof cfg !== "object" || Array.isArray(cfg) || (cfg.mcpServers !== undefined && (typeof cfg.mcpServers !== "object" || cfg.mcpServers === null || Array.isArray(cfg.mcpServers)))) {
+      return { agent: "Antigravity", file, done: false, why: "mcp_config.json has an unexpected shape; left as it is." };
+    }
+    if (cfg.mcpServers?.gamedexy) return { agent: "Antigravity", file, done: false, why: "already connected (an existing gamedexy entry is never changed)" };
+  }
+  const diff = [`@@ ${file} (mcpServers) @@`, ...JSON.stringify({ gamedexy: entry }, null, 2).split("\n").slice(1, -1).map((l) => `+${l}`)];
+  if (dryRun) return { agent: "Antigravity", file, done: false, why: "dry run: would add the gamedexy entry", diff };
+  const next = { ...cfg, mcpServers: { ...(cfg.mcpServers ?? {}), gamedexy: entry } };
+  mkdirSync(dirname(file), { recursive: true });
+  const backup = `${file}.bak-gamedexy-init`;
+  if (existsSync(file) && !existsSync(backup)) copyFileSync(file, backup);
+  writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`);
+  return { agent: "Antigravity", file, done: true, transport: transport === "url" ? "url" : "stdio (mcp-remote)", ...(existsSync(backup) ? { backup } : {}), diff };
+}
+
 // Read only when a run needs them (deep passes, engine recipes), so the main skill stays short.
 export const REFERENCE_FILES = ["DEEP.md", "ENGINES.md"];
 
 /**
- * @param {{ agent?: string, dryRun?: boolean, home?: string }} o
+ * @param {{ agent?: string, dryRun?: boolean, home?: string, transport?: string, has?: (cmd: string) => boolean }} o
  */
 export function init(o = {}) {
   const home = o.home ?? homedir();
   const dryRun = Boolean(o.dryRun);
   const want = (o.agent ?? "all").toLowerCase();
   const steps = [];
+  const hasCli = o.has ?? has;
+  if (o.transport !== undefined && !["stdio", "url"].includes(o.transport)) throw new Error(`--transport must be stdio or url (got "${o.transport}"). stdio is the mcp-remote bridge, url is Antigravity's own remote entry.`);
 
   // 1. The skill.
   const skill = withMark(readFileSync(join(SKILL_DIR, "SKILL.md"), "utf8"));
@@ -58,7 +101,7 @@ export function init(o = {}) {
     steps.push({ step: "Claude Code skill", ...place(join(home, ".claude", "skills", "gamedexy-game-map", "SKILL.md"), skill, dryRun) });
     for (const f of REFERENCE_FILES) steps.push({ step: `Claude Code skill: ${f}`, ...place(join(home, ".claude", "skills", "gamedexy-game-map", f), readFileSync(join(SKILL_DIR, f), "utf8"), dryRun) });
   }
-  if (want === "all" || want === "codex" || want === "cursor" || want === "other") {
+  if (want === "all" || want === "codex" || want === "cursor" || want === "antigravity" || want === "gemini" || want === "other") {
     const agents = withMark(readFileSync(join(SKILL_DIR, "AGENTS.md"), "utf8"));
     steps.push({
       step: "Instructions for Codex, Cursor and other agents",
@@ -70,7 +113,7 @@ export function init(o = {}) {
 
   // 2. The MCP connection.
   const mcp = [];
-  if ((want === "all" || want === "claude") && has("claude")) {
+  if ((want === "all" || want === "claude") && hasCli("claude")) {
     const listed = agentCli("claude", ["mcp", "get", "gamedexy"], { encoding: "utf8" });
     if (listed.status === 0) mcp.push({ agent: "Claude Code", done: false, why: "already connected" });
     else if (dryRun) mcp.push({ agent: "Claude Code", done: false, why: "dry run" });
@@ -79,7 +122,7 @@ export function init(o = {}) {
       mcp.push({ agent: "Claude Code", done: r.status === 0, ...(r.status === 0 ? {} : { why: (r.stderr || r.stdout || "").trim().slice(0, 200) }) });
     }
   }
-  if ((want === "all" || want === "codex") && has("codex")) {
+  if ((want === "all" || want === "codex") && hasCli("codex")) {
     const listed = agentCli("codex", ["mcp", "get", "gamedexy"], { encoding: "utf8" });
     if (listed.status === 0) mcp.push({ agent: "Codex", done: false, why: "already connected" });
     else if (dryRun) mcp.push({ agent: "Codex", done: false, why: "dry run" });
@@ -87,6 +130,13 @@ export function init(o = {}) {
       const r = agentCli("codex", ["mcp", "add", "gamedexy", "--url", MCP_URL], { encoding: "utf8" });
       mcp.push({ agent: "Codex", done: r.status === 0, ...(r.status === 0 ? {} : { why: (r.stderr || r.stdout || "").trim().slice(0, 200) }) });
     }
+  }
+
+  // Only when Antigravity is there: the agy command or its config folder (~/.gemini/config).
+  if ((want === "all" || want === "antigravity" || want === "gemini") && (hasCli("agy") || existsSync(join(home, ".gemini", "config")))) {
+    mcp.push(connectAntigravity({ home, dryRun, transport: o.transport ?? "stdio" }));
+  } else if (want === "antigravity" || want === "gemini") {
+    mcp.push({ agent: "Antigravity", done: false, why: "Antigravity not found (no agy command and no ~/.gemini/config folder)" });
   }
 
   // 3. What this machine can map.
@@ -103,9 +153,10 @@ export function init(o = {}) {
     mcp_by_hand: {
       "Claude Code": `claude mcp add --scope user --transport http gamedexy ${MCP_URL}`,
       Codex: `codex mcp add gamedexy --url ${MCP_URL}`,
+      Antigravity: `Add to ~/.gemini/config/mcp_config.json under "mcpServers": "gamedexy": { "command": "npx", "args": ["-y", "${MCP_REMOTE}", "${MCP_URL}"] } (or { "serverUrl": "${MCP_URL}" } to let Antigravity run the OAuth sign-in itself)`,
       "Cursor and others": `Add an HTTP MCP server named gamedexy with the URL ${MCP_URL}`,
     },
-    sign_in: "The first time your agent uses Gamedexy it opens a browser to sign in (Claude Code: /mcp, then gamedexy). Game Map needs a Pro plan.",
+    sign_in: "The first time your agent uses Gamedexy it opens a browser to sign in (Claude Code: /mcp, then gamedexy; Antigravity: the mcp-remote bridge opens the browser). Game Map needs a Pro plan.",
     machine,
     then: "Open your game's project in your agent and say: Map my game with Gamedexy",
   };

@@ -1,6 +1,6 @@
 {
   "name": "gamedexy",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Let your AI coding agent read your mobile game's code, open every screen on a simulator or emulator and map it with Gamedexy Game Map: every screen and how they connect, money and ads, bugs, and a comparison with real top games.",
   "type": "module",
   "bin": {

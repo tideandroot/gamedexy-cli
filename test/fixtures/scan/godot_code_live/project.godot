@@ -1,0 +1,7 @@
+config_version=5
+
+[application]
+config/name="Live Fixture"
+
+[autoload]
+ToastMenu="*res://src/ui/toast_menu.gd"
